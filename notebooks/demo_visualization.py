@@ -4,7 +4,7 @@ import threading
 import random
 from dataclasses import asdict, dataclass
 from typing import List, Dict, Optional
-from CEFO import BottleneckAgent, ClassroomAgent, Commitment, compute_slot_map
+from CEFO import BottleneckAgent, ClassroomAgent, Commitment, Offer, compute_slot_map
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'multiagent_secret_123'
@@ -26,7 +26,7 @@ class SimulationState:
             },
             "time_offsets": [0, -2, 2, -4, 4, -6, 6],
             "max_negotiation_rounds": 5,
-            "violation_threshold": 3,
+            "violation_threshold": 1,  # Changed from 3 to 1 to match CEFO.py
             "random_seed": 42
         }
         random.seed(self.config["random_seed"])
@@ -34,6 +34,11 @@ class SimulationState:
         self.classrooms = [ClassroomAgent(f"C{i+1}", self.config["attendance"][i], self.config) 
                           for i in range(self.config["num_classrooms"])]
         self.agents_by_id = {c.id: c for c in self.classrooms}
+        
+        self.classrooms[3].is_stubborn = True
+        
+        personalities_str = ', '.join([f'{c.id}:{c.personality}' for c in self.classrooms])
+        print(f"System Config: Agent C4 is 'stubborn'. Personalities: {personalities_str}")
 
 sim_state = SimulationState()
 
@@ -374,6 +379,11 @@ HTML_TEMPLATE = '''
             </div>
             
             <div class="chart-card">
+                <h3>🎭 Agent Personalities</h3>
+                <div class="chart" id="personalityChart"></div>
+            </div>
+            
+            <div class="chart-card">
                 <h3>🤝 Commitments Tracking</h3>
                 <div class="chart" id="commitmentChart"></div>
             </div>
@@ -386,6 +396,11 @@ HTML_TEMPLATE = '''
                         <div>Waiting for simulation data...</div>
                     </div>
                 </div>
+            </div>
+            
+            <div class="chart-card">
+                <h3>📈 Reputation Scores</h3>
+                <div class="chart" id="reputationChart"></div>
             </div>
         </div>
 
@@ -468,7 +483,9 @@ HTML_TEMPLATE = '''
         function updateCharts() {
             updateTrafficChart();
             updateScheduleChart();
+            updatePersonalityChart();
             updateCommitmentChart();
+            updateReputationChart();
             updateAgentStatus();
         }
 
@@ -633,31 +650,163 @@ HTML_TEMPLATE = '''
             Plotly.newPlot('commitmentChart', [activeTrace, fulfilledTrace], layout);
         }
 
+        function updatePersonalityChart() {
+            if (!currentData.agent_info) return;
+            
+            const personalities = {};
+            Object.values(currentData.agent_info).forEach(agent => {
+                personalities[agent.personality] = (personalities[agent.personality] || 0) + 1;
+            });
+            
+            const personalityTrace = {
+                labels: Object.keys(personalities),
+                values: Object.values(personalities),
+                type: 'pie',
+                marker: {
+                    colors: ['#e67e22', '#9b59b6', '#27ae60'] // orange, purple, green
+                },
+                textinfo: 'label+percent',
+                hoverinfo: 'label+value+percent',
+                hole: 0.4
+            };
+            
+            const layout = {
+                title: 'Agent Personalities Distribution',
+                height: 280,
+                showlegend: true,
+                annotations: [{
+                    text: 'Personalities',
+                    showarrow: false,
+                    font: { size: 14 }
+                }]
+            };
+            
+            Plotly.newPlot('personalityChart', [personalityTrace], layout);
+        }
+
+        function updateReputationChart() {
+            if (!currentData.agent_info) return;
+            
+            const agents = Object.keys(currentData.agent_info).sort();
+            const reputations = agents.map(agent => currentData.agent_info[agent].reputation);
+            
+            const reputationTrace = {
+                x: agents,
+                y: reputations,
+                type: 'bar',
+                marker: {
+                    color: reputations.map(rep => {
+                        if (rep >= 0.7) return '#27ae60';
+                        if (rep >= 0.5) return '#f39c12';
+                        return '#e74c3c';
+                    })
+                }
+            };
+            
+            const layout = {
+                title: 'Agent Reputation Scores',
+                xaxis: { title: 'Agents' },
+                yaxis: { 
+                    title: 'Reputation Score',
+                    range: [0, 1]
+                },
+                height: 280
+            };
+            
+            Plotly.newPlot('reputationChart', [reputationTrace], layout);
+        }
+
         function updateAgentStatus() {
             if (!currentData.schedules) return;
             
             const agentStatus = document.getElementById('agentStatus');
-            let html = '<div class="agent-grid">';
+            let html = '<div class="agent-grid-vertical">';
             
             Object.keys(currentData.schedules).forEach(agent => {
                 const slots = currentData.schedules[agent];
                 const totalStudents = slots.reduce((sum, [_, count]) => sum + count, 0);
+                const agentInfo = currentData.agent_info ? currentData.agent_info[agent] : null;
                 
-                html += `
-                <div class="agent-card">
-                    <div class="agent-header">
-                        <div class="agent-name">${agent}</div>
-                        <div class="agent-total">${totalStudents} students</div>
-                    </div>
-                    <div class="agent-slots">
-                        ${slots.map(slot => `
-                            <div class="slot-item">
-                                <span class="slot-time">${slot[0]} min</span>
-                                <span class="slot-count">${slot[1]} students</span>
+                if (agentInfo) {
+                    const personality = agentInfo.personality;
+                    const reputation = agentInfo.reputation;
+                    const isStubborn = agentInfo.is_stubborn;
+                    const utilityThreshold = agentInfo.utility_threshold;
+                    const violations = agentInfo.violations || 0;
+                    
+                    // Personality display with icons
+                    let personalityIcon = '🔄';
+                    let personalityText = 'Flexible';
+                    let personalityColor = '#27ae60';
+                    
+                    if (personality === 'prefers_early') {
+                        personalityIcon = '⏪';
+                        personalityText = 'Prefers Early';
+                        personalityColor = '#e67e22';
+                    } else if (personality === 'prefers_late') {
+                        personalityIcon = '⏩';
+                        personalityText = 'Prefers Late';
+                        personalityColor = '#9b59b6';
+                    }
+                    
+                    // Reputation color coding
+                    let repColor = '#27ae60';
+                    if (reputation < 0.7) repColor = '#f39c12';
+                    if (reputation < 0.5) repColor = '#e74c3c';
+                    
+                    html += `
+                    <div class="agent-card-vertical">
+                        <div class="agent-header-vertical">
+                            <div class="agent-name-vertical">${agent}</div>
+                            <div class="agent-total-vertical">${totalStudents} students</div>
+                        </div>
+                        
+                        <div class="agent-attributes">
+                            <div class="attribute-row">
+                                <span class="attribute-label">Personality:</span>
+                                <span class="attribute-value" style="color: ${personalityColor}">
+                                    ${personalityIcon} ${personalityText}
+                                </span>
                             </div>
-                        `).join('')}
-                    </div>
-                </div>`;
+                            
+                            <div class="attribute-row">
+                                <span class="attribute-label">Reputation:</span>
+                                <span class="attribute-value" style="color: ${repColor}">
+                                    ⭐ ${reputation.toFixed(2)}
+                                </span>
+                            </div>
+                            
+                            <div class="attribute-row">
+                                <span class="attribute-label">Utility Threshold:</span>
+                                <span class="attribute-value">📊 ${utilityThreshold}</span>
+                            </div>
+                            
+                            ${isStubborn ? `
+                            <div class="attribute-row">
+                                <span class="attribute-label">Status:</span>
+                                <span class="attribute-value" style="color: #e74c3c">🚫 Stubborn Agent</span>
+                            </div>
+                            ` : ''}
+                            
+                            ${violations > 0 ? `
+                            <div class="attribute-row">
+                                <span class="attribute-label">Violations:</span>
+                                <span class="attribute-value" style="color: #e74c3c">⚠️ ${violations}</span>
+                            </div>
+                            ` : ''}
+                        </div>
+                        
+                        <div class="agent-slots-vertical">
+                            <div class="slots-header">Current Schedule:</div>
+                            ${slots.map(slot => `
+                                <div class="slot-item-vertical">
+                                    <span class="slot-time">${slot[0]} min</span>
+                                    <span class="slot-count">${slot[1]} students</span>
+                                </div>
+                            `).join('')}
+                        </div>
+                    </div>`;
+                }
             });
             
             html += '</div>';
@@ -722,9 +871,17 @@ def handle_reset_simulation():
     sim_state.states = []
     sim_state.current_episode = 0
     sim_state.commitments_global = []
+    
+    # Reset all classrooms to initial state
     for classroom in sim_state.classrooms:
         classroom.planned_slots = [(0, classroom.attendance)]
         classroom.commitment_history = []
+        # Reset reputation but keep personality and stubborn flag
+        classroom.reputation = 1.0
+        classroom.is_stubborn = (classroom.id == "C4")
+        # Reassign personality (optional - if you want to keep same personalities, remove this)
+        # classroom.personality = random.choice(['prefers_early', 'prefers_late', 'flexible'])
+    
     socketio.emit('episode_update', get_initial_state())
 
 def run_episode(episode_num):
@@ -733,11 +890,7 @@ def run_episode(episode_num):
     
     logs.append(f"Starting Episode {episode_num} ({ep_tag})")
     
-    # 1) Reset to initial slots = 0 for all classrooms
-    for classroom in sim_state.classrooms:
-        classroom.planned_slots = [(0, classroom.attendance)]
-    
-    # Broadcast capacity
+    # 1) Broadcast capacity, initial slot assignment = 0
     msg = sim_state.B.broadcast_capacity(sim_state.config["attendance"], ep_tag)
     for c in sim_state.classrooms:
         c.on_capacity_broadcast(msg)
@@ -745,7 +898,7 @@ def run_episode(episode_num):
     slot_map = compute_slot_map(sim_state.classrooms)
     logs.append(f"[Initial slot map] {slot_map}")
     
-    # 2) Fulfill carry-over commitments (like your local simulation)
+    # 2) Fulfill carry-over commitments
     for c in sim_state.classrooms:
         c.fulfill_due_commitments(
             sim_state.commitments_global, 
@@ -759,7 +912,7 @@ def run_episode(episode_num):
     slot_map = compute_slot_map(sim_state.classrooms)
     logs.append(f"[After fulfill attempts] slot_map: {slot_map}")
     
-    # 3) Negotiation rounds (like your local simulation)
+    # 3) Enhanced Negotiation rounds with counter-offer logic
     for round_ in range(sim_state.config["max_negotiation_rounds"]):
         slot_map = compute_slot_map(sim_state.classrooms)
         congested_offsets = [off for off, val in slot_map.items() if val > sim_state.B.per_batch]
@@ -773,30 +926,80 @@ def run_episode(episode_num):
         for off in congested_offsets:
             congested_agents = [c for c in sim_state.classrooms if any(s[0]==off for s in c.planned_slots)]
             
-            if len(congested_agents) >= 2:
-                a1, a2 = congested_agents[0], congested_agents[1]
-                offer = a1.propose_shift(a2, off, episode_num)
+            if len(congested_agents) < 2:
+                continue
                 
-                if offer:
-                    if random.random() < a2.professor_willingness:
-                        logs.append(f"{a1.id} proposes to {a2.id}: shift {offer.shift_min} min, accepted.")
-                        a2.apply_offer(offer)
+            # Sort by number of students at this offset (descending)
+            congested_agents.sort(key=lambda agent: next((s[1] for s in agent.planned_slots if s[0] == off), 0), reverse=True)
+            
+            a1 = congested_agents[0]
+            a2 = congested_agents[1]
+
+            logs.append(f"[{a1.id}] (most students) is proposing to [{a2.id}].")
+
+            # REPUTATION CHECK
+            if a2.reputation < 0.5:
+                logs.append(f"[{a1.id}] refuses to negotiate with {a2.id} due to low reputation ({a2.reputation:.2f}).")
+                continue
+                
+            offer = a1.propose_shift(a2, off, episode_num, slot_map)
+            
+            if offer:
+                # Calculate utility for the offer
+                utility = a2.calculate_utility(offer)
+                logs.append(f"[{a2.id}] calculated utility for offer: {utility:.2f} (threshold: {a2.utility_threshold})")
+                
+                if a2.evaluate_offer(offer):
+                    # --- Offer Accepted ---
+                    logs.append(f"[{a1.id}]'s offer to shift by {offer.shift_min} min was ACCEPTED by [{a2.id}].")
+                    a2.apply_offer(offer)
+                    com = Commitment(
+                        commitment_id=f"com_{offer.offer_id}",
+                        proposer=offer.proposer,
+                        acceptor=offer.acceptor,
+                        shift_min=offer.shift_min,
+                        moved_students=offer.moved_students,
+                        created_episode=episode_num,
+                        due_episode=episode_num + 1
+                    )
+                    sim_state.commitments_global.append(com)
+                    a1.commitment_history.append(com)
+                    a2.commitment_history.append(com)
+                    logs.append(f"[COMMITTED] {com.commitment_id} created, due in episode {episode_num+1}.")
+                else:
+                    # --- Offer Rejected, Initiating Counter-Offer Sequence ---
+                    logs.append(f"[{a1.id}]'s offer was REJECTED by [{a2.id}] (utility too low). Checking for a counter-offer...")
+                    counter_offer = a2.formulate_counter_offer(offer, episode_num, slot_map)
+
+                    if counter_offer:
+                        # a2 made a counter-offer. Now a1 must evaluate it.
+                        counter_utility = a1.calculate_utility(counter_offer)
+                        logs.append(f"[{a2.id}] counters with a proposal to shift by {counter_offer.shift_min} min.")
+                        logs.append(f"[{a1.id}] calculated utility for counter-offer: {counter_utility:.2f} (threshold: {a1.utility_threshold})")
                         
-                        commitment = Commitment(
-                            commitment_id=f"com_{offer.offer_id}",
-                            proposer=offer.proposer,
-                            acceptor=offer.acceptor,
-                            shift_min=offer.shift_min,
-                            moved_students=offer.moved_students,
-                            created_episode=episode_num,
-                            due_episode=episode_num + 1
-                        )
-                        sim_state.commitments_global.append(commitment)
-                        a1.commitment_history.append(commitment)
-                        a2.commitment_history.append(commitment)
-                        logs.append(f"[COMMITTED] {commitment.commitment_id} created; due in episode {commitment.due_episode}")
+                        if a1.evaluate_offer(counter_offer):
+                            # a1 accepts the counter-offer
+                            logs.append(f"[{a1.id}] ACCEPTS the counter-offer from [{a2.id}].")
+                            a1.apply_offer(counter_offer)
+                            com = Commitment(
+                                commitment_id=f"com_{counter_offer.offer_id}",
+                                proposer=counter_offer.proposer,
+                                acceptor=counter_offer.acceptor,
+                                shift_min=counter_offer.shift_min,
+                                moved_students=counter_offer.moved_students,
+                                created_episode=episode_num,
+                                due_episode=episode_num + 1
+                            )
+                            sim_state.commitments_global.append(com)
+                            a1.commitment_history.append(com)
+                            a2.commitment_history.append(com)
+                            logs.append(f"[COMMITTED] {com.commitment_id} created from counter-offer, due in episode {episode_num+1}.")
+                        else:
+                            # a1 rejects the counter-offer
+                            logs.append(f"[{a1.id}] REJECTS the counter-offer from [{a2.id}] (utility too low). Negotiation ends.")
                     else:
-                        logs.append(f"{a1.id} proposes to {a2.id}: shift {offer.shift_min} min, REJECTED by {a2.id}.")
+                        # a2 did not provide a counter-offer
+                        logs.append(f"[{a2.id}] did not provide a counter-offer. Negotiation ends.")
     
     final_slot_map = compute_slot_map(sim_state.classrooms)
     logs.append(f"[Final slot_map after episode] {final_slot_map}")
@@ -804,31 +1007,59 @@ def run_episode(episode_num):
     for c in sim_state.classrooms:
         logs.append(f" {c.id}: {c.planned_slots}")
     
+    # Include enhanced agent information
     return {
         'episode': episode_num,
         'slot_map': final_slot_map,
         'schedules': {classroom.id: classroom.planned_slots for classroom in sim_state.classrooms},
         'commitments': [asdict(commitment) for commitment in sim_state.commitments_global],
         'capacity': sim_state.B.per_batch,
-        'logs': logs
+        'logs': logs,
+        'agent_info': {
+            classroom.id: {
+                'personality': classroom.personality,
+                'reputation': classroom.reputation,
+                'is_stubborn': classroom.is_stubborn,
+                'utility_threshold': classroom.utility_threshold,
+                'violations': len([c for c in classroom.commitment_history if c.times_missed > 0])
+            } for classroom in sim_state.classrooms
+        }
     }
 
 def get_initial_state():
+    # Reset to initial state with all classrooms at offset 0
     for classroom in sim_state.classrooms:
         classroom.planned_slots = [(0, classroom.attendance)]
         classroom.commitment_history = []
     
     slot_map = compute_slot_map(sim_state.classrooms)
+    
+    # Get personalities for initial display
+    personalities = [f"{c.id}: {c.personality}" for c in sim_state.classrooms]
+    personality_str = ", ".join(personalities)
+    
     return {
         'episode': 0,
         'slot_map': slot_map,
         'schedules': {classroom.id: classroom.planned_slots for classroom in sim_state.classrooms},
         'commitments': [asdict(commitment) for commitment in sim_state.commitments_global],
         'capacity': sim_state.B.per_batch,
-        'logs': ['Multi-Agent Traffic Simulation Ready', 
-                'All classrooms start at time offset 0', 
-                'Click "Start Simulation" to begin...']
+        'logs': [
+            'Multi-Agent Traffic Simulation Ready', 
+            'All classrooms start at time offset 0', 
+            f'Agent Personalities: {personality_str}',
+            'Agent C4 is stubborn (will not fulfill commitments)',
+            'Click "Start Simulation" to begin...'
+        ],
+        'agent_info': {
+            classroom.id: {
+                'personality': classroom.personality,
+                'reputation': classroom.reputation,
+                'is_stubborn': classroom.is_stubborn
+            } for classroom in sim_state.classrooms
+        }
     }
+
 
 def start_server():
     try:
