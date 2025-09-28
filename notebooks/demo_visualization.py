@@ -514,7 +514,24 @@ HTML_TEMPLATE = '''
             const data = [];
             const classrooms = Object.keys(currentData.schedules);
             
+            // Define a color palette for classrooms
+            const colorPalette = {
+                'C1': '#FF6B6B',  // Red
+                'C2': '#4ECDC4',  // Teal
+                'C3': '#45B7D1',  // Blue
+                'C4': '#96CEB4',  // Green
+                'C5': '#FFEAA7',  // Yellow
+                'C6': '#DDA0DD',  // Plum
+                'C7': '#98D8C8',  // Mint
+                'C8': '#F7DC6F',  // Light Yellow
+                'C9': '#BB8FCE',  // Light Purple
+                'C10': '#85C1E9'  // Light Blue
+            };
+            
             classrooms.forEach(classroom => {
+                // Get color from palette or generate a random one if not defined
+                const color = colorPalette[classroom] || '#' + Math.floor(Math.random()*16777215).toString(16);
+                
                 currentData.schedules[classroom].forEach(([offset, count]) => {
                     data.push({
                         x: [offset],
@@ -523,28 +540,65 @@ HTML_TEMPLATE = '''
                         mode: 'markers',
                         marker: { 
                             size: Math.max(15, count * 0.8),
-                            color: '#3498db'
+                            color: color,
+                            line: {
+                                color: '#2c3e50',
+                                width: 1
+                            }
                         },
                         name: classroom,
-                        text: [`${count} students at ${offset} minutes`],
-                        hoverinfo: 'text'
+                        text: [`${classroom}: ${count} students at ${offset} minutes`],
+                        hoverinfo: 'text',
+                        showlegend: false  // We'll handle legend separately
                     });
                 });
             });
             
+            // Create legend traces
+            const legendTraces = classrooms.map(classroom => {
+                const color = colorPalette[classroom] || '#' + Math.floor(Math.random()*16777215).toString(16);
+                return {
+                    x: [null],
+                    y: [null],
+                    type: 'scatter',
+                    mode: 'markers',
+                    marker: {
+                        size: 10,
+                        color: color,
+                        symbol: 'circle'
+                    },
+                    name: classroom,
+                    showlegend: true,
+                    hoverinfo: 'none'
+                };
+            });
+            
             const layout = {
                 title: 'Classroom Exit Schedules',
-                xaxis: { title: 'Time Offset (minutes)' },
+                xaxis: { 
+                    title: 'Time Offset (minutes)',
+                    gridcolor: '#f0f0f0',
+                    zerolinecolor: '#f0f0f0'
+                },
                 yaxis: { 
                     title: 'Classroom',
-                    tickvals: classrooms.map((_, idx) => idx),
-                    ticktext: classrooms
+                    gridcolor: '#f0f0f0',
+                    zerolinecolor: '#f0f0f0'
                 },
                 height: 280,
-                margin: { t: 40, r: 30, l: 80, b: 50 }
+                margin: { t: 40, r: 30, l: 80, b: 50 },
+                plot_bgcolor: 'rgba(248,249,250,0.5)',
+                paper_bgcolor: 'rgba(255,255,255,0.8)',
+                legend: {
+                    orientation: 'h',
+                    y: -0.2,
+                    x: 0.5,
+                    xanchor: 'center'
+                }
             };
             
-            Plotly.newPlot('scheduleChart', data, layout);
+            // Combine data and legend traces
+            Plotly.newPlot('scheduleChart', [...data, ...legendTraces], layout);
         }
 
         function updateCommitmentChart() {
@@ -675,36 +729,81 @@ def handle_reset_simulation():
 
 def run_episode(episode_num):
     logs = []
+    ep_tag = f"{sim_state.config['episode_base_name']}_ep{episode_num}"
+    
+    logs.append(f"Starting Episode {episode_num} ({ep_tag})")
+    
+    # 1) Reset to initial slots = 0 for all classrooms
     for classroom in sim_state.classrooms:
         classroom.planned_slots = [(0, classroom.attendance)]
-    logs.append(f"Starting Episode {episode_num}")
+    
+    # Broadcast capacity
+    msg = sim_state.B.broadcast_capacity(sim_state.config["attendance"], ep_tag)
+    for c in sim_state.classrooms:
+        c.on_capacity_broadcast(msg)
+    
     slot_map = compute_slot_map(sim_state.classrooms)
-    total_students = sum(slot_map.values())
-    logs.append(f"Initial traffic: {total_students} students, Capacity: {sim_state.B.per_batch}")
-    if total_students > sim_state.B.per_batch:
-        logs.append("Congestion detected! Agents negotiating...")
-        for i in range(min(2, len(sim_state.classrooms))):
-            if i + 1 < len(sim_state.classrooms):
-                agent1 = sim_state.classrooms[i]
-                agent2 = sim_state.classrooms[i + 1]
-                if random.random() < agent2.professor_willingness:
-                    offer = agent1.propose_shift(agent2, 0, episode_num)
-                    if offer:
-                        agent2.apply_offer(offer)
+    logs.append(f"[Initial slot map] {slot_map}")
+    
+    # 2) Fulfill carry-over commitments (like your local simulation)
+    for c in sim_state.classrooms:
+        c.fulfill_due_commitments(
+            sim_state.commitments_global, 
+            current_episode=episode_num,
+            slot_map=slot_map, 
+            B_agent=sim_state.B, 
+            agents_by_id=sim_state.agents_by_id,
+            violation_threshold=sim_state.config["violation_threshold"]
+        )
+    
+    slot_map = compute_slot_map(sim_state.classrooms)
+    logs.append(f"[After fulfill attempts] slot_map: {slot_map}")
+    
+    # 3) Negotiation rounds (like your local simulation)
+    for round_ in range(sim_state.config["max_negotiation_rounds"]):
+        slot_map = compute_slot_map(sim_state.classrooms)
+        congested_offsets = [off for off, val in slot_map.items() if val > sim_state.B.per_batch]
+        
+        if not congested_offsets:
+            logs.append(f"No congestion after negotiation round {round_} in episode {episode_num}")
+            break
+            
+        logs.append(f"[Negotiation round {round_}] congested offsets: {congested_offsets}")
+        
+        for off in congested_offsets:
+            congested_agents = [c for c in sim_state.classrooms if any(s[0]==off for s in c.planned_slots)]
+            
+            if len(congested_agents) >= 2:
+                a1, a2 = congested_agents[0], congested_agents[1]
+                offer = a1.propose_shift(a2, off, episode_num)
+                
+                if offer:
+                    if random.random() < a2.professor_willingness:
+                        logs.append(f"{a1.id} proposes to {a2.id}: shift {offer.shift_min} min, accepted.")
+                        a2.apply_offer(offer)
+                        
                         commitment = Commitment(
                             commitment_id=f"com_{offer.offer_id}",
-                            proposer=agent1.id,
-                            acceptor=agent2.id,
+                            proposer=offer.proposer,
+                            acceptor=offer.acceptor,
                             shift_min=offer.shift_min,
                             moved_students=offer.moved_students,
                             created_episode=episode_num,
                             due_episode=episode_num + 1
                         )
                         sim_state.commitments_global.append(commitment)
-                        logs.append(f"{agent1.id} → {agent2.id}: Moved {offer.moved_students} students")
+                        a1.commitment_history.append(commitment)
+                        a2.commitment_history.append(commitment)
+                        logs.append(f"[COMMITTED] {commitment.commitment_id} created; due in episode {commitment.due_episode}")
+                    else:
+                        logs.append(f"{a1.id} proposes to {a2.id}: shift {offer.shift_min} min, REJECTED by {a2.id}.")
+    
     final_slot_map = compute_slot_map(sim_state.classrooms)
-    logs.append(f"Episode {episode_num} complete")
-    logs.append(f"Final traffic distribution: {final_slot_map}")
+    logs.append(f"[Final slot_map after episode] {final_slot_map}")
+    logs.append("Schedules:")
+    for c in sim_state.classrooms:
+        logs.append(f" {c.id}: {c.planned_slots}")
+    
     return {
         'episode': episode_num,
         'slot_map': final_slot_map,
@@ -715,6 +814,10 @@ def run_episode(episode_num):
     }
 
 def get_initial_state():
+    for classroom in sim_state.classrooms:
+        classroom.planned_slots = [(0, classroom.attendance)]
+        classroom.commitment_history = []
+    
     slot_map = compute_slot_map(sim_state.classrooms)
     return {
         'episode': 0,
@@ -722,17 +825,19 @@ def get_initial_state():
         'schedules': {classroom.id: classroom.planned_slots for classroom in sim_state.classrooms},
         'commitments': [asdict(commitment) for commitment in sim_state.commitments_global],
         'capacity': sim_state.B.per_batch,
-        'logs': ['Multi-Agent Traffic Simulation Ready', 'Click "Start Simulation" to begin...']
+        'logs': ['Multi-Agent Traffic Simulation Ready', 
+                'All classrooms start at time offset 0', 
+                'Click "Start Simulation" to begin...']
     }
 
 def start_server():
     try:
         print("Starting Multi-Agent Simulation Server...")
-        print("Open your browser and go to: http://localhost:5008")
+        print("Open your browser and go to: http://localhost:5010")
         socketio.run(
             app, 
             host='0.0.0.0', 
-            port=5008, 
+            port=5010, 
             debug=False, 
             use_reloader=False,
             allow_unsafe_werkzeug=True
